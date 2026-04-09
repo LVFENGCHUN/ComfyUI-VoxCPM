@@ -2,7 +2,7 @@
 
 ComfyUI custom nodes for VoxCPM2.
 
-This project wraps the official OpenBMB VoxCPM inference code as ComfyUI nodes.
+This project wraps the official OpenBMB VoxCPM2 inference code as ComfyUI nodes.
 
 ![ComfyUI-VoxCPM Node Example](https://github.com/user-attachments/assets/cff37898-2e10-48b7-9dca-34964e476a35)
 
