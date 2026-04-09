@@ -4,8 +4,6 @@ ComfyUI custom nodes for VoxCPM2.
 
 This project wraps the official OpenBMB VoxCPM inference code as ComfyUI nodes, with the model loaded from ComfyUI/models/VoxCPM2 by default.
 
-The runtime VoxCPM source code is bundled inside this repository, so the custom node no longer depends on an external ComfyUI/VoxCPM/src checkout.
-
 ![ComfyUI-VoxCPM Node Example](https://github.com/user-attachments/assets/cff37898-2e10-48b7-9dca-34964e476a35)
 
 Upstream links:
