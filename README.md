@@ -19,6 +19,9 @@ Based on the official VoxCPM2 project and model page, this wrapper supports the 
 - Voice design from natural-language speaker descriptions
 - Controllable cloning from short reference audio
 - Ultimate cloning with reference audio plus transcript
+- Persistent reference voice feature caching in the local `voice/` folder
+- Feature-based inference from saved reference voice features
+- Feature-based inference with optional `control_instruction`
 - 48kHz output from the VoxCPM2 model pipeline
 - Context-aware synthesis
 
@@ -136,6 +139,15 @@ Example:
           ├─ special_tokens_map.json
           └─ audiovae.pth
 
+### Reference voice feature path
+
+Saved reference voice features are written to:
+
+    ComfyUI/voice
+
+Each saved speaker feature is stored as a `.pt` file.
+The feature-based inference nodes read from this folder and show the relative feature name in the node dropdown without the `.pt` suffix.
+
 ## How This Wrapper Works
 
 This custom node ships with a bundled copy of the runtime VoxCPM source code inside the plugin directory.
@@ -167,6 +179,11 @@ When to use load_denoiser:
 - Enable it if you plan to use denoise on noisy reference audio.
 - Leave it off if you only need plain text to speech and want fewer dependencies.
 
+Important behavior:
+- `load_denoiser` only controls whether the auxiliary denoiser model is loaded.
+- The actual denoise step only happens later when a generation or feature-save node has `denoise` enabled.
+- Denoise is an audio pre-processing step for prompt or reference audio, not a sampling parameter inside the main VoxCPM generation model.
+
 When to use optimize:
 - Enable it for long-term repeated inference.
 - Leave it off for first setup, compatibility checks, or lower-risk debugging.
@@ -183,6 +200,7 @@ Direct text to speech in any officially supported language.
 Inputs:
 - model
 - text
+- seed
 - cfg_value
 - inference_timesteps
 - max_len
@@ -205,6 +223,7 @@ Example inputs:
 - Cantonese: 伙计，唔该来一个 A 餐，冻奶茶少甜。
 
 Parameter guidance:
+- seed: workflow-only seed input for easy reruns in ComfyUI; it does not currently control internal VoxCPM sampling
 - cfg_value: higher usually follows the prompt style more closely
 - inference_timesteps: higher usually costs more time
 - max_len: increase if the generated audio is cut too early
@@ -224,6 +243,7 @@ Inputs:
 - model
 - text
 - voice_description
+- seed
 - cfg_value
 - inference_timesteps
 - max_len
@@ -270,6 +290,7 @@ Inputs:
 - reference_audio
 - text
 - style_instruction
+- seed
 - cfg_value
 - inference_timesteps
 - max_len
@@ -317,6 +338,7 @@ Inputs:
 - prompt_text
 - text
 - optional reference_audio
+- seed
 - cfg_value
 - inference_timesteps
 - max_len
@@ -368,6 +390,7 @@ Inputs:
 - optional reference_audio
 - optional prompt_audio
 - optional prompt_text
+- seed
 - cfg_value
 - inference_timesteps
 - max_len
@@ -390,6 +413,89 @@ How different input combinations map to modes:
 Recommended rule:
 - If you are new, use the specialized nodes first.
 - Use the Advanced node only after you clearly understand what each input does.
+
+### 7. VoxCPM Save Reference Features
+
+Purpose:
+Encode a reference audio clip once, then save the resulting reference-mode VoxCPM prompt cache to the local `voice/` folder for later reuse.
+
+Inputs:
+- model
+- reference_audio
+- feature_name
+- denoise
+
+Important behavior:
+- This is a save-only node and does not output a value.
+- The file is written to `ComfyUI/voice/<feature_name>.pt`.
+- If `denoise` is enabled and the model was loaded with `load_denoiser=True`, the reference audio is denoised before feature encoding.
+
+How to use:
+1. Connect the model output.
+2. Connect a clean reference clip.
+3. Enter a reusable `feature_name`, such as `narrator_female_01`.
+4. Run the workflow once to save the feature file.
+5. Use one of the feature-based inference nodes later.
+
+Recommended use cases:
+- You want to avoid re-encoding the same reference clip every run.
+- You want to manage a small library of reusable speaker presets.
+- You want to freeze the processed reference voice features for more consistent reuse.
+
+### 8. VoxCPM Generate From Features
+
+Purpose:
+Generate speech from a previously saved reference voice feature without reconnecting the original reference audio.
+
+Inputs:
+- model
+- feature_name
+- text
+- seed
+- cfg_value
+- inference_timesteps
+- max_len
+- normalize
+
+Important behavior:
+- `feature_name` is selected from files under `ComfyUI/voice`.
+- The dropdown shows the relative feature name without the `.pt` suffix.
+- This node loads the saved reference-mode prompt cache and generates directly from it.
+
+How to use:
+1. Save a reference feature with VoxCPM Save Reference Features.
+2. Load the same model family.
+3. Select the saved `feature_name` from the dropdown.
+4. Enter text and run.
+
+### 9. VoxCPM Generate From Features With Control
+
+Purpose:
+Generate speech from a saved reference voice feature while also applying a `control_instruction`.
+
+Inputs:
+- model
+- feature_name
+- text
+- control_instruction
+- seed
+- cfg_value
+- inference_timesteps
+- max_len
+- normalize
+
+How to use:
+1. Save a reference feature first.
+2. Select the saved feature in this node.
+3. Enter the text to speak.
+4. Optionally add `control_instruction` to steer expression, pace, or style.
+5. Run the node.
+
+Example control_instruction:
+- calm and steady narration
+- slightly faster, cheerful tone
+- softer ending, more emotional
+- 粤语口吻，轻松一点，像朋友聊天
 
 ## Typical Workflows
 
@@ -417,12 +523,32 @@ Use:
 - Load VoxCPM Model
 - VoxCPM Ultimate Cloning
 
+### Workflow E: Save a reusable speaker preset
+
+Use:
+- Load VoxCPM Model
+- VoxCPM Save Reference Features
+
+### Workflow F: Generate from a saved speaker preset
+
+Use:
+- Load VoxCPM Model
+- VoxCPM Generate From Features
+
+### Workflow G: Generate from a saved speaker preset with style control
+
+Use:
+- Load VoxCPM Model
+- VoxCPM Generate From Features With Control
+
 ## Tips
 
 - cfg_value controls how strongly the output follows the prompt or reference style
 - inference_timesteps trades speed for quality
 - normalize helps with numbers, dates, abbreviations, and text cleanup
 - denoise is useful when the reference audio is noisy
+- if you plan to reuse the same speaker often, save it once into `ComfyUI/voice` and use the feature-based nodes afterward
+- the current `seed` inputs are mainly for ComfyUI workflow rerun ergonomics and are not wired into native VoxCPM sampling
 - for Chinese dialects, writing the actual dialect text usually works better than plain Mandarin text
 
 ## Troubleshooting

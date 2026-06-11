@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -11,8 +12,10 @@ import torchaudio
 
 
 BUNDLED_VOXCPM_ROOT = Path(__file__).resolve().parent
+VOXCPM_PROJECT_ROOT = BUNDLED_VOXCPM_ROOT.parent.parent
 VOXCPM_PRIMARY_MODELS_ROOT = Path(folder_paths.models_dir) / "VoxCPM2"
 VOXCPM_FALLBACK_MODELS_ROOT = Path(folder_paths.models_dir) / "VoxCPM"
+VOXCPM_VOICE_FEATURES_ROOT = VOXCPM_PROJECT_ROOT / "voice"
 VOXCPM_MODEL_ROOTS = [
     VOXCPM_PRIMARY_MODELS_ROOT,
     VOXCPM_FALLBACK_MODELS_ROOT,
@@ -27,11 +30,20 @@ _LAST_CACHE_KEY: tuple[str, bool, bool] | None = None
 
 
 GENERATION_INPUTS = {
+    "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
     "cfg_value": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 10.0, "step": 0.1}),
     "inference_timesteps": ("INT", {"default": 10, "min": 1, "max": 100, "step": 1}),
     "max_len": ("INT", {"default": 4096, "min": 64, "max": 65536, "step": 64}),
     "normalize": ("BOOLEAN", {"default": False}),
     "denoise": ("BOOLEAN", {"default": False}),
+}
+
+FEATURE_GENERATION_INPUTS = {
+    "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
+    "cfg_value": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 10.0, "step": 0.1}),
+    "inference_timesteps": ("INT", {"default": 10, "min": 1, "max": 100, "step": 1}),
+    "max_len": ("INT", {"default": 4096, "min": 64, "max": 65536, "step": 64}),
+    "normalize": ("BOOLEAN", {"default": False}),
 }
 
 
@@ -213,6 +225,98 @@ def _prepare_output_audio(wav: Any, sample_rate: int) -> dict[str, Any]:
     }
 
 
+def _sanitize_feature_name(feature_name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", (feature_name or "").strip()).strip("._-")
+    if not cleaned:
+        raise ValueError("feature_name cannot be empty")
+    return cleaned
+
+
+def _get_feature_output_path(feature_name: str) -> Path:
+    VOXCPM_VOICE_FEATURES_ROOT.mkdir(parents=True, exist_ok=True)
+    return VOXCPM_VOICE_FEATURES_ROOT / f"{_sanitize_feature_name(feature_name)}.pt"
+
+
+def _list_feature_options() -> list[str]:
+    if not VOXCPM_VOICE_FEATURES_ROOT.exists():
+        return [""]
+
+    feature_files = sorted(
+        str(path.relative_to(VOXCPM_VOICE_FEATURES_ROOT).with_suffix(""))
+        for path in VOXCPM_VOICE_FEATURES_ROOT.rglob("*.pt")
+        if path.is_file()
+    )
+    return feature_files or [""]
+
+
+def _get_feature_full_path(feature_name: str) -> Path:
+    if not feature_name:
+        raise ValueError("feature_name cannot be empty")
+
+    relative_feature = Path(feature_name)
+    if relative_feature.suffix != ".pt":
+        relative_feature = relative_feature.with_suffix(".pt")
+
+    feature_path = (VOXCPM_VOICE_FEATURES_ROOT / relative_feature).resolve()
+    voice_root = VOXCPM_VOICE_FEATURES_ROOT.resolve()
+    if os.path.commonpath((str(voice_root), str(feature_path))) != str(voice_root):
+        raise ValueError("feature_name must stay within the voice directory")
+    if not feature_path.is_file():
+        raise FileNotFoundError(f"VoxCPM feature file not found: {feature_name}")
+    return feature_path
+
+
+def _build_reference_prompt_cache(model_wrapper, reference_audio, denoise=False):
+    current_model = model_wrapper["model"]
+
+    temp_paths: list[str] = []
+    try:
+        reference_wav_path = _audio_to_temp_wav(reference_audio, "voxcpm_reference_")
+        if reference_wav_path is None:
+            raise ValueError("reference_audio is required")
+        temp_paths.append(reference_wav_path)
+
+        actual_ref_path = reference_wav_path
+        if denoise and getattr(current_model, "denoiser", None) is not None:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                temp_paths.append(tmp.name)
+            current_model.denoiser.enhance(reference_wav_path, output_path=temp_paths[-1])
+            actual_ref_path = temp_paths[-1]
+
+        prompt_cache = current_model.tts_model.build_prompt_cache(reference_wav_path=actual_ref_path)
+        return prompt_cache
+    finally:
+        _cleanup_temp_paths(temp_paths)
+
+
+def _save_prompt_cache_bundle(feature_path: Path, model_wrapper, prompt_cache: dict[str, Any], feature_name: str) -> dict[str, Any]:
+    bundle = {
+        "metadata": {
+            "format": "voxcpm_reference_features",
+            "format_version": 1,
+            "feature_name": feature_name,
+            "model_path": model_wrapper.get("model_path", ""),
+        },
+        "prompt_cache": prompt_cache,
+    }
+    torch.save(bundle, feature_path)
+    return bundle
+
+
+def _load_prompt_cache_bundle(feature_name: str) -> dict[str, Any]:
+    bundle = torch.load(_get_feature_full_path(feature_name), map_location="cpu", weights_only=False)
+    if not isinstance(bundle, dict):
+        raise ValueError("Invalid VoxCPM feature file: expected a dict bundle")
+    prompt_cache = bundle.get("prompt_cache")
+    if not isinstance(prompt_cache, dict):
+        raise ValueError("Invalid VoxCPM feature file: missing prompt_cache")
+    if prompt_cache.get("mode") != "reference":
+        raise ValueError("Only reference-mode VoxCPM feature files are supported")
+    if "ref_audio_feat" not in prompt_cache:
+        raise ValueError("Invalid VoxCPM feature file: missing ref_audio_feat")
+    return bundle
+
+
 def _run_generation(
     model_wrapper,
     text,
@@ -225,6 +329,7 @@ def _run_generation(
     max_len=4096,
     normalize=False,
     denoise=False,
+    seed=0,
 ):
     current_model = model_wrapper["model"]
     final_text = _compose_text(text, control_instruction)
@@ -261,6 +366,41 @@ def _run_generation(
         return (audio,)
     finally:
         _cleanup_temp_paths(temp_paths)
+
+
+def _run_generation_from_prompt_cache(
+    model_wrapper,
+    prompt_cache,
+    text,
+    control_instruction="",
+    cfg_value=2.0,
+    inference_timesteps=10,
+    max_len=4096,
+    normalize=False,
+):
+    current_model = model_wrapper["model"]
+    final_text = _compose_text(text, control_instruction)
+    if normalize:
+        if getattr(current_model, "text_normalizer", None) is None:
+            from voxcpm.utils.text_normalize import TextNormalizer  # type: ignore
+
+            current_model.text_normalizer = TextNormalizer()
+        final_text = current_model.text_normalizer.normalize(final_text)
+
+    generate_fn = getattr(current_model.tts_model, "generate_with_prompt_cache", None)
+    if generate_fn is None:
+        raise ValueError("Current VoxCPM model does not support prompt cache generation")
+
+    generation_result = generate_fn(
+        target_text=final_text,
+        prompt_cache=prompt_cache,
+        cfg_value=float(cfg_value),
+        inference_timesteps=int(inference_timesteps),
+        max_len=int(max_len),
+    )
+    wav = generation_result[0] if isinstance(generation_result, tuple) else generation_result
+    audio = _prepare_output_audio(wav, current_model.tts_model.sample_rate)
+    return (audio,)
 
 
 class VoxCPMModelLoader:
@@ -306,10 +446,11 @@ class VoxCPMMultilingualTTS:
     FUNCTION = "generate"
     CATEGORY = "audio/VoxCPM"
 
-    def generate(self, model, text, cfg_value, inference_timesteps, max_len, normalize, denoise):
+    def generate(self, model, text, seed, cfg_value, inference_timesteps, max_len, normalize, denoise):
         return _run_generation(
             model_wrapper=model,
             text=text,
+            seed=seed,
             cfg_value=cfg_value,
             inference_timesteps=inference_timesteps,
             max_len=max_len,
@@ -347,11 +488,12 @@ class VoxCPMVoiceDesign:
     FUNCTION = "generate"
     CATEGORY = "audio/VoxCPM"
 
-    def generate(self, model, text, voice_description, cfg_value, inference_timesteps, max_len, normalize, denoise):
+    def generate(self, model, text, voice_description, seed, cfg_value, inference_timesteps, max_len, normalize, denoise):
         return _run_generation(
             model_wrapper=model,
             text=text,
             control_instruction=voice_description,
+            seed=seed,
             cfg_value=cfg_value,
             inference_timesteps=inference_timesteps,
             max_len=max_len,
@@ -396,6 +538,7 @@ class VoxCPMControllableCloning:
         reference_audio,
         text,
         style_instruction,
+        seed,
         cfg_value,
         inference_timesteps,
         max_len,
@@ -407,6 +550,7 @@ class VoxCPMControllableCloning:
             text=text,
             control_instruction=style_instruction,
             reference_audio=reference_audio,
+            seed=seed,
             cfg_value=cfg_value,
             inference_timesteps=inference_timesteps,
             max_len=max_len,
@@ -454,6 +598,7 @@ class VoxCPMUltimateCloning:
         prompt_audio,
         prompt_text,
         text,
+        seed,
         cfg_value,
         inference_timesteps,
         max_len,
@@ -467,6 +612,7 @@ class VoxCPMUltimateCloning:
             reference_audio=reference_audio,
             prompt_audio=prompt_audio,
             prompt_text=prompt_text,
+            seed=seed,
             cfg_value=cfg_value,
             inference_timesteps=inference_timesteps,
             max_len=max_len,
@@ -520,6 +666,7 @@ class VoxCPMGenerateAudio:
         model,
         text,
         control_instruction,
+        seed,
         cfg_value,
         inference_timesteps,
         max_len,
@@ -536,11 +683,136 @@ class VoxCPMGenerateAudio:
             reference_audio=reference_audio,
             prompt_audio=prompt_audio,
             prompt_text=prompt_text,
+            seed=seed,
             cfg_value=cfg_value,
             inference_timesteps=inference_timesteps,
             max_len=max_len,
             normalize=normalize,
             denoise=denoise,
+        )
+
+
+class VoxCPMSaveReferenceFeatures:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("VOXCPM_MODEL",),
+                "reference_audio": ("AUDIO",),
+                "feature_name": (
+                    "STRING",
+                    {
+                        "default": "speaker_reference",
+                    },
+                ),
+                "denoise": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ()
+    RETURN_NAMES = ()
+    OUTPUT_NODE = True
+    FUNCTION = "save_features"
+    CATEGORY = "audio/VoxCPM/Features"
+
+    def save_features(self, model, reference_audio, feature_name, denoise):
+        prompt_cache = _build_reference_prompt_cache(model, reference_audio, denoise=denoise)
+        safe_name = _sanitize_feature_name(feature_name)
+        feature_path = _get_feature_output_path(safe_name)
+        _save_prompt_cache_bundle(feature_path, model, prompt_cache, safe_name)
+        print(f"[ComfyUI-VoxCPM] Saved reference features to: {feature_path}")
+        return {}
+
+
+class VoxCPMGenerateFromFeatures:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("VOXCPM_MODEL",),
+                "feature_name": (
+                    _list_feature_options(),
+                    {
+                        "default": _list_feature_options()[0],
+                    },
+                ),
+                "text": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "你好，这是固定声音特征推理测试。",
+                    },
+                ),
+                **FEATURE_GENERATION_INPUTS,
+            }
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "generate"
+    CATEGORY = "audio/VoxCPM/Features"
+
+    def generate(self, model, feature_name, text, seed, cfg_value, inference_timesteps, max_len, normalize):
+        bundle = _load_prompt_cache_bundle(feature_name)
+        _ = seed
+        return _run_generation_from_prompt_cache(
+            model_wrapper=model,
+            prompt_cache=bundle["prompt_cache"],
+            text=text,
+            cfg_value=cfg_value,
+            inference_timesteps=inference_timesteps,
+            max_len=max_len,
+            normalize=normalize,
+        )
+
+
+class VoxCPMGenerateFromFeaturesWithControl:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("VOXCPM_MODEL",),
+                "feature_name": (
+                    _list_feature_options(),
+                    {
+                        "default": _list_feature_options()[0],
+                    },
+                ),
+                "text": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "你好，这是固定声音特征带控制推理测试。",
+                    },
+                ),
+                "control_instruction": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "",
+                    },
+                ),
+                **FEATURE_GENERATION_INPUTS,
+            }
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "generate"
+    CATEGORY = "audio/VoxCPM/Features"
+
+    def generate(self, model, feature_name, text, control_instruction, seed, cfg_value, inference_timesteps, max_len, normalize):
+        bundle = _load_prompt_cache_bundle(feature_name)
+        _ = seed
+        return _run_generation_from_prompt_cache(
+            model_wrapper=model,
+            prompt_cache=bundle["prompt_cache"],
+            text=text,
+            control_instruction=control_instruction,
+            cfg_value=cfg_value,
+            inference_timesteps=inference_timesteps,
+            max_len=max_len,
+            normalize=normalize,
         )
 
 
@@ -551,6 +823,9 @@ NODE_CLASS_MAPPINGS = {
     "VoxCPMControllableCloning": VoxCPMControllableCloning,
     "VoxCPMUltimateCloning": VoxCPMUltimateCloning,
     "VoxCPMGenerateAudio": VoxCPMGenerateAudio,
+    "VoxCPMSaveReferenceFeatures": VoxCPMSaveReferenceFeatures,
+    "VoxCPMGenerateFromFeatures": VoxCPMGenerateFromFeatures,
+    "VoxCPMGenerateFromFeaturesWithControl": VoxCPMGenerateFromFeaturesWithControl,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -560,4 +835,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VoxCPMControllableCloning": "VoxCPM Controllable Cloning",
     "VoxCPMUltimateCloning": "VoxCPM Ultimate Cloning",
     "VoxCPMGenerateAudio": "VoxCPM Generate Audio Advanced",
+    "VoxCPMSaveReferenceFeatures": "VoxCPM Save Reference Features",
+    "VoxCPMGenerateFromFeatures": "VoxCPM Generate From Features",
+    "VoxCPMGenerateFromFeaturesWithControl": "VoxCPM Generate From Features With Control",
 }
