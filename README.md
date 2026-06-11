@@ -143,7 +143,7 @@ Example:
 
 Saved reference voice features are written to:
 
-    ComfyUI/voice
+    ComfyUI/custom_nodes/ComfyUI-VoxCPM/voice
 
 Each saved speaker feature is stored as a `.pt` file.
 The feature-based inference nodes read from this folder and show the relative feature name in the node dropdown without the `.pt` suffix.
@@ -427,7 +427,7 @@ Inputs:
 
 Important behavior:
 - This is a save-only node and does not output a value.
-- The file is written to `ComfyUI/voice/<feature_name>.pt`.
+- The file is written to `ComfyUI/custom_nodes/ComfyUI-VoxCPM/voice/<feature_name>.pt`.
 - If `denoise` is enabled and the model was loaded with `load_denoiser=True`, the reference audio is denoised before feature encoding.
 
 How to use:
@@ -459,6 +459,7 @@ Inputs:
 
 Important behavior:
 - `feature_name` is selected from files under `ComfyUI/voice`.
+- `feature_name` is selected from files under `ComfyUI/custom_nodes/ComfyUI-VoxCPM/voice`.
 - The dropdown shows the relative feature name without the `.pt` suffix.
 - This node loads the saved reference-mode prompt cache and generates directly from it.
 
@@ -547,7 +548,7 @@ Use:
 - inference_timesteps trades speed for quality
 - normalize helps with numbers, dates, abbreviations, and text cleanup
 - denoise is useful when the reference audio is noisy
-- if you plan to reuse the same speaker often, save it once into `ComfyUI/voice` and use the feature-based nodes afterward
+- if you plan to reuse the same speaker often, save it once into `ComfyUI/custom_nodes/ComfyUI-VoxCPM/voice` and use the feature-based nodes afterward
 - the current `seed` inputs are mainly for ComfyUI workflow rerun ergonomics and are not wired into native VoxCPM sampling
 - for Chinese dialects, writing the actual dialect text usually works better than plain Mandarin text
 
